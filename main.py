@@ -36,32 +36,32 @@ NIFTY500 = NIFTY200
 
 UNIVERSES = {}
 if UNIVERSE in ('BOTH', 'N200'):
-          UNIVERSES['Nifty200'] = {'stocks': NIFTY200, 'capital': CAP_N200}
-      if UNIVERSE in ('BOTH', 'N500'):
-                UNIVERSES['Nifty500'] = {'stocks': NIFTY500, 'capital': CAP_N500}
+              UNIVERSES['Nifty200'] = {'stocks': NIFTY200, 'capital': CAP_N200}
+          if UNIVERSE in ('BOTH', 'N500'):
+                        UNIVERSES['Nifty500'] = {'stocks': NIFTY500, 'capital': CAP_N500}
 
 _state = {}
 _last_run_time = None
 _last_run_summary = "No scan run yet."
 
 def tg_send(text, chat_id=None):
-          cid = chat_id or CHAT_ID
-          if not BOT_TOKEN or not cid: return
-                    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+              cid = chat_id or CHAT_ID
+              if not BOT_TOKEN or not cid: return
+                            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-                  requests.post(url, json={"chat_id": cid, "text": text, "parse_mode": "Markdown"}, timeout=10)
+                      requests.post(url, json={"chat_id": cid, "text": text, "parse_mode": "Markdown"}, timeout=10)
 except Exception as e:
         log.error(f"Telegram error: {e}")
 
 def calc_rsi(s, w):
-          d = s.diff()
+              d = s.diff()
     g = d.where(d > 0, 0.0).rolling(w).mean()
     l = (-d.where(d < 0, 0.0)).rolling(w).mean()
     rs = g / l.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 def fetch_data(universe_stocks):
-          lookback = max(RS_P * 2, 200)
+              lookback = max(RS_P * 2, 200)
     start = (datetime.now() - timedelta(days=lookback)).strftime('%Y-%m-%d')
     tickers = [s + '.NS' for s in universe_stocks] + ['^NSEI']
     raw = yf.download(tickers, start=start, auto_adjust=True, progress=False)
@@ -70,28 +70,28 @@ def fetch_data(universe_stocks):
     return nifty, data
 
 def generate_signals(nifty, data):
-          candidates = []
+              candidates = []
     for sym, prices in data.items():
-                  if len(prices) < RS_P + 2: continue
-                                rs = (prices.iloc[-1] / prices.iloc[-RS_P-1]) / (nifty.iloc[-1] / nifty.iloc[-RS_P-1]) - 1
+                      if len(prices) < RS_P + 2: continue
+                                        rs = (prices.iloc[-1] / prices.iloc[-RS_P-1]) / (nifty.iloc[-1] / nifty.iloc[-RS_P-1]) - 1
         if rs <= 0: continue
-                      rsi = calc_rsi(prices, RSI_L).tail(10).min()
+                          rsi = calc_rsi(prices, RSI_L).tail(10).min()
         if pd.isna(rsi) or rsi > RSI_T: continue
-                      if prices.iloc[-1] <= prices.iloc[-2]: continue
-                                    if SMA_ENT:
-                                                      sma = prices.rolling(SMA_L).mean().iloc[-1]
-                                                      if prices.iloc[-1] <= sma: continue
-                                                                    candidates.append({'symbol': sym, 'rs': round(rs, 4), 'rsi': round(rsi, 2), 'price': round(prices.iloc[-1], 2)})
+                          if prices.iloc[-1] <= prices.iloc[-2]: continue
+                                            if SMA_ENT:
+                                                                  sma = prices.rolling(SMA_L).mean().iloc[-1]
+                                                                  if prices.iloc[-1] <= sma: continue
+                                                                                    candidates.append({'symbol': sym, 'rs': round(rs, 4), 'rsi': round(rsi, 2), 'price': round(prices.iloc[-1], 2)})
     candidates.sort(key=lambda x: x['rs'], reverse=True)
     return candidates[:TOP_N]
 
 def run_scan(triggered_by="scheduler"):
-          global _state, _last_run_time, _last_run_summary
+              global _state, _last_run_time, _last_run_summary
     now = datetime.now(IST)
     log.info(f"Scan Started | {triggered_by}")
     summary = []
     for uname, ucfg in UNIVERSES.items():
-                  nifty, data = fetch_data(ucfg['stocks'])
+                      nifty, data = fetch_data(ucfg['stocks'])
         sigs = generate_signals(nifty, data)
         msg = f"\n{uname} Signals:\n" + "\n".join([f"{s['symbol']}: RS={s['rs']} RSI={s['rsi']} P={s['price']}" for s in sigs])
         summary.append(msg)
@@ -102,23 +102,23 @@ def run_scan(triggered_by="scheduler"):
 app = Flask(__name__)
 @app.route('/')
 def home(): return jsonify({"status": "running", "last_run": _last_run_time})
-      @app.route('/webhook', methods=['POST'])
+          @app.route('/webhook', methods=['POST'])
 def webhook():
-          data = request.get_json(silent=True)
+              data = request.get_json(silent=True)
     if data and 'message' in data:
-                  text = data['message'].get('text', '')
+                      text = data['message'].get('text', '')
         if text == '/run': threading.Thread(target=run_scan, args=("manual",)).start()
-                  return jsonify({"ok": True})
+                      return jsonify({"ok": True})
 
 def self_ping():
-          while True:
-                        if RENDER_URL:
-                                          try: requests.get(f"{RENDER_URL}/ping")
-                                                            except: pass
+              while True:
+                                if RENDER_URL:
+                                                      try: requests.get(f"{RENDER_URL}/ping")
+                                                                            except: pass
         time.sleep(600)
 
 def scheduled_run():
-          now = datetime.now(IST)
+              now = datetime.now(IST)
     if now.weekday() < 5: run_scan("scheduler")
 
 scheduler = BackgroundScheduler(timezone=IST)
@@ -127,4 +127,4 @@ scheduler.start()
 threading.Thread(target=self_ping, daemon=True).start()
 
 if __name__ == '__main__':
-          app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+              app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
