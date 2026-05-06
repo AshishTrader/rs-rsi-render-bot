@@ -9,16 +9,10 @@ import os, logging, threading, time, requests
 from datetime import datetime, timedelta, date
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
-import pytz
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import warnings
-warnings.filterwarnings('ignore# -- CONFIG FROM ENV VARS -------------------------------------
-BOT_TOKEN   = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-CHAT_ID     = os.environ.get('TELEGRAM_CHAT_ID', RENDER_URL  = os.environ.get('RENDER_URL', '')  # e.g. https://your-app.onrender.com
-
-RS_P        = int(os.environ.get('RS_PERIOD', 70))
+import pimport pandas as pd
+import numpy asimport yfinance as yf
+import warniwarnings.filterwarnings('ignore# -- CONFIG FROM ENV VARS -------------------------------------
+BOT_TOKEN   = os.environ.get('TELEGRAM_BOT_TOKEN', CHAT_ID     = os.environ.get('TELEGRAM_CHAT_ID', RENDER_URL  = os.environ.get('RENDER_URL', '')  # e.g. https://your-app.onrender.cRS_P        = int(os.environ.get('RS_PERIOD', 70))
 RSI_L       = int(os.environ.get('RSI_LENGTH', 5))
 RSI_T       = float(os.environ.get('RSI_THRESHOLD', 40))
 SMA_L       = int(os.environ.get('SMA_LENGTH', 15))
