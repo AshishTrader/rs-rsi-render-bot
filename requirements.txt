@@ -1,0 +1,9 @@
+flask
+gunicorn
+requests
+pandas
+numpy
+yfinance
+apscheduler
+pytz
+openpyxl
