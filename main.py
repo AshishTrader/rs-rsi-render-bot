@@ -87,15 +87,13 @@ NIFTY500 = (
 
 UNIVERSES = {}
 if UNIVERSE in ('BOTH', 'N200'):
-      UNIVERSES['Nifty200'] = {'stocks': NIFTY200, 'capital': CAP_N200}
-  if UNIVERSE in ('BOTH', 'N500'):
+          UNIVERSES['Nifty200'] = {'stocks': NIFTY200, 'capital': CAP_N200}if UNIVERSE in ('BOTH', 'N500'):
         UNIVERSES['Nifty500'] = {'stocks': NIFTY500, 'capital': CAP_N500}
+          
 
-# -- IN-MEMORY STATE (resets on restart) ----------------------
-_state = {}
+# -- IN-MEMORY STATE (resets on re
 _last_run_time = None
 _last_run_summary = "No scan run yet."
-
 # -- TELEGRAM HELPERS -----------------------------------------
 def tg_send(text, chat_id=None):
       cid = chat_id or CHAT_ID
