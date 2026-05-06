@@ -14,12 +14,9 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import warnings
-warnings.filterwarnings('ignore')
-
-# -- CONFIG FROM ENV VARS -------------------------------------
+warnings.filterwarnings('ignore# -- CONFIG FROM ENV VARS -------------------------------------
 BOT_TOKEN   = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-CHAT_ID     = os.environ.get('TELEGRAM_CHAT_ID', '')
-RENDER_URL  = os.environ.get('RENDER_URL', '')  # e.g. https://your-app.onrender.com
+CHAT_ID     = os.environ.get('TELEGRAM_CHAT_ID', RENDER_URL  = os.environ.get('RENDER_URL', '')  # e.g. https://your-app.onrender.com
 
 RS_P        = int(os.environ.get('RS_PERIOD', 70))
 RSI_L       = int(os.environ.get('RSI_LENGTH', 5))
