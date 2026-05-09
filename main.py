@@ -252,118 +252,132 @@ def check_sma_exits(data, holdings):
     return exits
 
 # ── CORE RUN ─────────────────────────────────────────────────
-def run_scan(triggered_by="scheduler"):
+def run_scan(triggered_by="scheduler", reply_chat_id=None):
+    """Main scan. reply_chat_id: send errors here if global CHAT_ID fails."""
     global _state, _last_run_time, _last_run_summary
-    now_ist = datetime.now(IST)
-    today   = now_ist.strftime('%Y-%m-%d')
-    log.info(f"=== RS+RSI Scan Started | Triggered by: {triggered_by} ===")
 
-    header = (
-        f"🤖 *RS+RSI Bot — Scan Started*\n"
-        f"🕒 {now_ist.strftime('%d %b %Y, %I:%M %p IST')}\n"
-        f"📊 Params: RS={RS_P} | RSI({RSI_L})<{RSI_T} | SMA={SMA_L} | Top{TOP_N}\n"
-        f"{'─' * 30}"
-    )
-    tg_send(header)
+    def notify(text):
+        """Send to global CHAT_ID; also to reply_chat_id if different."""
+        tg_send(text)
+        if reply_chat_id and str(reply_chat_id) != str(CHAT_ID):
+            tg_send(text, chat_id=reply_chat_id)
 
-    all_msgs = []
+    try:
+        now_ist = datetime.now(IST)
+        today   = now_ist.strftime('%Y-%m-%d')
+        log.info(f"=== RS+RSI Scan Started | Triggered by: {triggered_by} ===")
 
-    for uname, ucfg in UNIVERSES.items():
-        u_state = _state.setdefault(uname, {
-            'holdings': {},
-            'last_rebalance': '2000-01-01',
-            'capital': ucfg['capital']
-        })
+        header = (
+            f"🤖 *RS+RSI Bot — Scan Started*\n"
+            f"🕒 {now_ist.strftime('%d %b %Y, %I:%M %p IST')}\n"
+            f"📊 Params: RS={RS_P} | RSI({RSI_L})<{RSI_T} | SMA={SMA_L} | Top{TOP_N}\n"
+            f"{'─' * 30}"
+        )
+        notify(header)
 
-        tg_send(f"⏳ Fetching data for *{uname}* ({len(ucfg['stocks'])} stocks)...")
-        nifty, data = fetch_data(ucfg['stocks'])
+        all_msgs = []
 
-        msgs = [f"\n📁 *{uname}*\n{'─'*20}"]
+        for uname, ucfg in UNIVERSES.items():
+            u_state = _state.setdefault(uname, {
+                'holdings': {},
+                'last_rebalance': '2000-01-01',
+                'capital': ucfg['capital']
+            })
 
-        # ── SMA EXIT CHECK ───────────────────────────────────
-        if u_state['holdings']:
-            exits = check_sma_exits(data, u_state['holdings'])
-            if exits:
-                msgs.append("🛑 *SMA Exits:*")
-                for ex in exits:
-                    msgs.append(
-                        f"  ❌ *{ex['symbol']}* | Price: ₹{ex['price']:.2f} | PnL: {ex['pnl']:+.2f}%"
-                    )
-                    del u_state['holdings'][ex['symbol']]
-            else:
-                msgs.append("✅ No SMA exits triggered.")
+            notify(f"⏳ Fetching data for *{uname}* ({len(ucfg['stocks'])} stocks)...")
+            nifty, data = fetch_data(ucfg['stocks'])
+            notify(f"✅ Loaded {len(data)} stocks for *{uname}*. Running signals...")
 
-        # ── REBALANCE CHECK ──────────────────────────────────
-        last_reb = u_state['last_rebalance']
-        days_since = (date.fromisoformat(today) - date.fromisoformat(last_reb)).days
-        do_rebal = days_since >= REBAL_N
+            msgs = [f"\n📁 *{uname}*\n{'─'*20}"]
 
-        if do_rebal:
-            msgs.append(f"\n🔄 *Rebalance Day* (last: {last_reb})")
-
-            # Exit all holdings
+            # ── SMA EXIT CHECK ───────────────────────────────────
             if u_state['holdings']:
-                msgs.append("📤 *Closing all positions:*")
-                for sym, h in list(u_state['holdings'].items()):
+                exits = check_sma_exits(data, u_state['holdings'])
+                if exits:
+                    msgs.append("🛑 *SMA Exits:*")
+                    for ex in exits:
+                        msgs.append(
+                            f"  ❌ *{ex['symbol']}* | Price: ₹{ex['price']:.2f} | PnL: {ex['pnl']:+.2f}%"
+                        )
+                        del u_state['holdings'][ex['symbol']]
+                else:
+                    msgs.append("✅ No SMA exits triggered.")
+
+            # ── REBALANCE CHECK ──────────────────────────────────
+            last_reb   = u_state['last_rebalance']
+            days_since = (date.fromisoformat(today) - date.fromisoformat(last_reb)).days
+            do_rebal   = days_since >= REBAL_N
+
+            if do_rebal:
+                msgs.append(f"\n🔄 *Rebalance Day* (last: {last_reb})")
+
+                if u_state['holdings']:
+                    msgs.append("📤 *Closing all positions:*")
+                    for sym, h in list(u_state['holdings'].items()):
+                        cur = data[sym]['Close'].iloc[-1] if sym in data else h['entry_price']
+                        pct = (cur / h['entry_price'] - 1) * 100
+                        msgs.append(f"  🛑 SELL *{sym}* | ₹{cur:.2f} | PnL: {pct:+.2f}%")
+                    u_state['holdings'] = {}
+
+                signals = generate_signals(nifty, data)
+                log.info(f"  -> {len(signals)} signals for {uname}")
+
+                if signals:
+                    alloc = u_state['capital'] / TOP_N
+                    msgs.append(f"\n🚀 *New Entries* (Alloc/stock: ₹{alloc:,.0f}):")
+                    for sig in signals:
+                        qty  = max(1, int(alloc / sig['close']))
+                        cost = qty * sig['close']
+                        msgs.append(
+                            f"  ✅ BUY *{sig['symbol']}*\n"
+                            f"     RS={sig['rs_score']} | RSI_min={sig['rsi_min']} | "
+                            f"₹{sig['close']} | SMA15=₹{sig['sma15']} | Qty={qty} | Cost=₹{cost:,.0f}"
+                        )
+                        u_state['holdings'][sig['symbol']] = {
+                            'entry_price': sig['close'],
+                            'qty': qty,
+                            'entry_date': today,
+                            'rs_score': sig['rs_score']
+                        }
+                else:
+                    msgs.append("⚠️ No qualifying stocks found. Staying in cash.")
+
+                u_state['last_rebalance'] = today
+
+            else:
+                next_reb = REBAL_N - days_since
+                msgs.append(f"\n📅 Not a rebalance day. Next in *{next_reb} day(s)* (last: {last_reb})")
+
+            # ── PORTFOLIO SUMMARY ────────────────────────────────
+            msgs.append(f"\n💼 *Current Holdings ({uname}):*")
+            if u_state['holdings']:
+                for sym, h in u_state['holdings'].items():
                     cur = data[sym]['Close'].iloc[-1] if sym in data else h['entry_price']
                     pct = (cur / h['entry_price'] - 1) * 100
                     msgs.append(
-                        f"  🛑 SELL *{sym}* | ₹{cur:.2f} | PnL: {pct:+.2f}%"
+                        f"  📌 *{sym}* | Entry=₹{h['entry_price']} | CMP=₹{cur:.2f} | "
+                        f"Qty={h['qty']} | PnL={pct:+.2f}% | Since={h['entry_date']}"
                     )
-                u_state['holdings'] = {}
-
-            # Generate new signals
-            signals = generate_signals(nifty, data)
-            log.info(f"  -> {len(signals)} signals for {uname}")
-
-            if signals:
-                alloc = u_state['capital'] / TOP_N
-                msgs.append(f"\n🚀 *New Entries* (Alloc/stock: ₹{alloc:,.0f}):*")
-                for sig in signals:
-                    qty = max(1, int(alloc / sig['close']))
-                    cost = qty * sig['close']
-                    msgs.append(
-                        f"  ✅ BUY *{sig['symbol']}*\n"
-                        f"     RS={sig['rs_score']} | RSI_min={sig['rsi_min']} | "
-                        f"₹{sig['close']} | SMA15=₹{sig['sma15']} | Qty={qty} | Cost=₹{cost:,.0f}"
-                    )
-                    u_state['holdings'][sig['symbol']] = {
-                        'entry_price': sig['close'],
-                        'qty': qty,
-                        'entry_date': today,
-                        'rs_score': sig['rs_score']
-                    }
             else:
-                msgs.append("⚠️ No qualifying stocks found. Staying in cash.")
+                msgs.append("  💰 All Cash")
 
-            u_state['last_rebalance'] = today
+            _state[uname] = u_state
+            all_msgs.extend(msgs)
 
-        else:
-            next_reb = REBAL_N - days_since
-            msgs.append(f"\n📅 Not a rebalance day. Next in *{next_reb} day(s)* (last: {last_reb})")
+        _last_run_time    = now_ist.strftime('%d %b %Y, %I:%M %p IST')
+        _last_run_summary = '\n'.join(all_msgs)
 
-        # ── PORTFOLIO SUMMARY ────────────────────────────────
-        msgs.append(f"\n💼 *Current Holdings ({uname}):*")
-        if u_state['holdings']:
-            for sym, h in u_state['holdings'].items():
-                cur = data[sym]['Close'].iloc[-1] if sym in data else h['entry_price']
-                pct = (cur / h['entry_price'] - 1) * 100
-                msgs.append(
-                    f"  📌 *{sym}* | Entry=₹{h['entry_price']} | CMP=₹{cur:.2f} | "
-                    f"Qty={h['qty']} | PnL={pct:+.2f}% | Since={h['entry_date']}"
-                )
-        else:
-            msgs.append("  💰 All Cash")
+        notify(_last_run_summary)
+        notify(f"✅ *Scan Complete* | {_last_run_time}")
+        log.info("=== Scan Complete ===")
 
-        _state[uname] = u_state
-        all_msgs.extend(msgs)
-
-    _last_run_time = now_ist.strftime('%d %b %Y, %I:%M %p IST')
-    _last_run_summary = '\n'.join(all_msgs)
-
-    tg_send(_last_run_summary)
-    tg_send(f"✅ *Scan Complete* | {_last_run_time}")
-    log.info("=== Scan Complete ===")
+    except Exception as e:
+        import traceback
+        err_msg = f"❌ *Scan ERROR*\n```\n{traceback.format_exc()[-1500:]}\n```"
+        log.error(f"run_scan crashed: {e}")
+        tg_send(err_msg)
+        if reply_chat_id:
+            tg_send(err_msg, chat_id=reply_chat_id)
 
 
 # ── FLASK APP ────────────────────────────────────────────────
@@ -397,8 +411,8 @@ def webhook():
             f"📊 Universe: *{UNIVERSE}* | Top {TOP_N} stocks"
         )
     elif text.startswith('/run'):
-        tg_answer(chat_id, "🔄 Starting RS+RSI scan now... Please wait ~2 minutes.")
-        threading.Thread(target=run_scan, args=("manual /run",), daemon=True).start()
+        tg_answer(chat_id, "🔄 Starting RS+RSI scan now... Please wait ~5-8 minutes (batched download).")
+        threading.Thread(target=run_scan, args=("manual /run", chat_id), daemon=True).start()
     elif text.startswith('/status'):
         if _last_run_time:
             tg_answer(chat_id, f"🕒 *Last run:* {_last_run_time}\n\n{_last_run_summary}")
