@@ -5,7 +5,7 @@ RS + RSI Telegram Bot — Render Cloud Edition
 - All results sent to Telegram
 - No state persistence, no Angel One, no Excel
 """
-import os, logging, threading, time, requests
+import os, gc, logging, threading, time, requests
 from datetime import datetime, timedelta, date
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -159,46 +159,52 @@ def calc_rsi(s, w):
     rs = g / l.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-# ── DATA FETCH (batched to avoid OOM on Render 512MB free tier) ──
+# ── DATA FETCH ───────────────────────────────────────────────────────
+# Only Close prices needed — saves ~80% memory vs OHLCV on Render 512MB
 def fetch_data(universe_stocks):
     lookback_days = max(RS_P * 2, 200)
     start = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
-    BATCH = 80
+    BATCH = 100  # Safe with Close-only
 
-    # Fetch Nifty index separately
+    # Fetch Nifty index
     nifty = pd.Series(dtype=float)
     try:
         ni = yf.download('^NSEI', start=start, auto_adjust=True, progress=False)
-        nifty = ni['Close'].dropna() if not ni.empty else nifty
+        if not ni.empty:
+            nifty = (ni['Close'] if 'Close' in ni.columns else ni.iloc[:, 0]).dropna()
     except Exception as e:
         log.error(f"Nifty fetch error: {e}")
 
-    # Fetch stocks in batches
     data = {}
     batches = [universe_stocks[i:i+BATCH] for i in range(0, len(universe_stocks), BATCH)]
-    log.info(f"Fetching {len(universe_stocks)} stocks in {len(batches)} batches of {BATCH}...")
+    log.info(f"Fetching Close prices for {len(universe_stocks)} stocks in {len(batches)} batches...")
 
     for b_idx, batch in enumerate(batches):
         tickers = [s + '.NS' for s in batch]
         try:
-            raw = yf.download(tickers, start=start, auto_adjust=True, progress=False, group_by='ticker')
+            raw = yf.download(
+                tickers, start=start, auto_adjust=True,
+                progress=False, group_by='ticker'
+            )
             if isinstance(raw.columns, pd.MultiIndex):
                 for sym in batch:
                     try:
-                        df = raw[sym + '.NS'][['Open', 'High', 'Low', 'Close']].dropna()
-                        if len(df) >= RS_P + 5:
-                            data[sym] = df
+                        close = raw[sym + '.NS']['Close'].dropna()
+                        if len(close) >= RS_P + 5:
+                            data[sym] = pd.DataFrame({'Close': close})
                     except:
                         pass
-            elif len(batch) == 1:
-                df = raw[['Open', 'High', 'Low', 'Close']].dropna()
-                if len(df) >= RS_P + 5:
-                    data[batch[0]] = df
+            elif len(batch) == 1 and not raw.empty:
+                close = raw['Close'].dropna()
+                if len(close) >= RS_P + 5:
+                    data[batch[0]] = pd.DataFrame({'Close': close})
+            del raw          # Explicitly free batch memory
+            gc.collect()     # Force GC between batches
         except Exception as e:
             log.error(f"Batch {b_idx+1} error: {e}")
-        log.info(f"  Batch {b_idx+1}/{len(batches)}: {len(data)} stocks so far")
+        log.info(f"  Batch {b_idx+1}/{len(batches)} done | {len(data)} stocks loaded")
 
-    log.info(f"Fetch complete: {len(data)} stocks | Nifty rows: {len(nifty)}")
+    log.info(f"Fetch complete: {len(data)}/{len(universe_stocks)} stocks | Nifty rows: {len(nifty)}")
     return nifty, data
 
 # ── SIGNAL GENERATION ────────────────────────────────────────
@@ -373,11 +379,19 @@ def run_scan(triggered_by="scheduler", reply_chat_id=None):
 
     except Exception as e:
         import traceback
-        err_msg = f"❌ *Scan ERROR*\n```\n{traceback.format_exc()[-1500:]}\n```"
+        tb = traceback.format_exc()[-1200:]
+        err_msg = f"SCAN ERROR\n\n{tb}"
         log.error(f"run_scan crashed: {e}")
-        tg_send(err_msg)
-        if reply_chat_id:
-            tg_send(err_msg, chat_id=reply_chat_id)
+        # Use plain text (no Markdown) so Telegram always accepts it
+        for cid in set(filter(None, [CHAT_ID, str(reply_chat_id) if reply_chat_id else None])):
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={"chat_id": cid, "text": err_msg},
+                    timeout=10
+                )
+            except:
+                pass
 
 
 # ── FLASK APP ────────────────────────────────────────────────
