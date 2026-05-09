@@ -159,29 +159,46 @@ def calc_rsi(s, w):
     rs = g / l.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-# ── DATA FETCH ───────────────────────────────────────────────
+# ── DATA FETCH (batched to avoid OOM on Render 512MB free tier) ──
 def fetch_data(universe_stocks):
     lookback_days = max(RS_P * 2, 200)
     start = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
-    tickers = [s + '.NS' for s in universe_stocks] + ['^NSEI']
-    log.info(f"Fetching {len(tickers)} tickers from {start}...")
-    raw = yf.download(tickers, start=start, auto_adjust=True, progress=False, group_by='ticker')
-    nifty, data = pd.Series(dtype=float), {}
+    BATCH = 80
+
+    # Fetch Nifty index separately
+    nifty = pd.Series(dtype=float)
     try:
-        if isinstance(raw.columns, pd.MultiIndex):
-            nifty = raw['^NSEI']['Close'].dropna()
-            for sym in universe_stocks:
-                try:
-                    df = raw[sym + '.NS'][['Open', 'High', 'Low', 'Close']].dropna()
-                    if len(df) >= RS_P + 5:
-                        data[sym] = df
-                except:
-                    pass
-        else:
-            nifty = raw['Close'].dropna()
+        ni = yf.download('^NSEI', start=start, auto_adjust=True, progress=False)
+        nifty = ni['Close'].dropna() if not ni.empty else nifty
     except Exception as e:
-        log.error(f"Data parse error: {e}")
-    log.info(f"  -> {len(data)} stocks loaded. Nifty rows: {len(nifty)}")
+        log.error(f"Nifty fetch error: {e}")
+
+    # Fetch stocks in batches
+    data = {}
+    batches = [universe_stocks[i:i+BATCH] for i in range(0, len(universe_stocks), BATCH)]
+    log.info(f"Fetching {len(universe_stocks)} stocks in {len(batches)} batches of {BATCH}...")
+
+    for b_idx, batch in enumerate(batches):
+        tickers = [s + '.NS' for s in batch]
+        try:
+            raw = yf.download(tickers, start=start, auto_adjust=True, progress=False, group_by='ticker')
+            if isinstance(raw.columns, pd.MultiIndex):
+                for sym in batch:
+                    try:
+                        df = raw[sym + '.NS'][['Open', 'High', 'Low', 'Close']].dropna()
+                        if len(df) >= RS_P + 5:
+                            data[sym] = df
+                    except:
+                        pass
+            elif len(batch) == 1:
+                df = raw[['Open', 'High', 'Low', 'Close']].dropna()
+                if len(df) >= RS_P + 5:
+                    data[batch[0]] = df
+        except Exception as e:
+            log.error(f"Batch {b_idx+1} error: {e}")
+        log.info(f"  Batch {b_idx+1}/{len(batches)}: {len(data)} stocks so far")
+
+    log.info(f"Fetch complete: {len(data)} stocks | Nifty rows: {len(nifty)}")
     return nifty, data
 
 # ── SIGNAL GENERATION ────────────────────────────────────────
