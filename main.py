@@ -406,6 +406,28 @@ app = Flask(__name__)
 def home():
     return jsonify({"status": "RS+RSI Bot is running", "last_run": _last_run_time})
 
+@app.route('/diag', methods=['GET'])
+def diag():
+    """Synchronous diagnostic — tests MongoDB + yfinance directly."""
+    result = {}
+    # Test MongoDB
+    try:
+        col   = db_manager._get_col()
+        count = col.count_documents({})
+        result['mongodb'] = f"OK - {count} documents"
+    except Exception as e:
+        result['mongodb'] = f"FAILED: {e}"
+    # Test yfinance
+    try:
+        import yfinance as yf
+        h = yf.Ticker("RELIANCE.NS").history(period="3d")
+        result['yfinance'] = f"OK - RELIANCE rows: {len(h)}"
+    except Exception as e:
+        result['yfinance'] = f"FAILED: {e}"
+    result['env_mongo_set'] = bool(os.environ.get('MONGODB_URI'))
+    result['env_token_set'] = bool(os.environ.get('TELEGRAM_BOT_TOKEN'))
+    return jsonify(result)
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json(silent=True)
