@@ -6,4 +6,5 @@ numpy
 yfinance
 apscheduler
 pytz
-openpyxl
+pymongo[srv]
+dnspython
