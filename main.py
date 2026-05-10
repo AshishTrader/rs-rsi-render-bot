@@ -432,17 +432,51 @@ def webhook():
     elif text.startswith('/run'):
         tg_answer(chat_id, "🔄 Starting scan... First run takes ~5 min (DB init). Later runs ~1 min.")
         threading.Thread(target=run_scan, args=("manual /run", chat_id), daemon=True).start()
-    elif text.startswith('/init'):
-        def _force_init():
+    elif text.startswith('/dbtest'):
+        def _dbtest(cid):
+            def _raw_send(txt):
+                try:
+                    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                                  json={"chat_id": cid, "text": txt}, timeout=10)
+                except: pass
+            _raw_send("🔍 Testing MongoDB connection...")
             try:
+                col = db_manager._get_col()
+                count = col.count_documents({})
+                _raw_send(f"✅ MongoDB OK! Documents in DB: {count}")
+            except Exception as e:
+                _raw_send(f"❌ MongoDB FAILED: {e}")
+            _raw_send("🔍 Testing yfinance (1 stock)...")
+            try:
+                import yfinance as yf
+                t = yf.Ticker("RELIANCE.NS")
+                h = t.history(period="5d")
+                _raw_send(f"✅ yfinance OK! RELIANCE rows: {len(h)}")
+            except Exception as e:
+                _raw_send(f"❌ yfinance FAILED: {e}")
+        tg_answer(chat_id, "Running DB + yfinance tests...")
+        threading.Thread(target=_dbtest, args=(chat_id,), daemon=True).start()
+    elif text.startswith('/init'):
+        _cid = chat_id
+        def _force_init():
+            def _raw(txt):
+                try:
+                    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                                  json={"chat_id": _cid, "text": txt}, timeout=10)
+                except: pass
+            try:
+                _raw("Thread started. Connecting to MongoDB...")
                 all_syms = list(set(sum([v['stocks'] for v in UNIVERSES.values()], [])))
                 db_manager._get_col().delete_many({})
-                db_manager.init_or_update(all_syms, notify_fn=lambda t: tg_send(t, chat_id=chat_id))
-                tg_send("✅ DB re-initialized. Send /run to scan.", chat_id=chat_id)
+                _raw(f"MongoDB cleared. Starting download of {len(all_syms)} stocks...")
+                db_manager.init_or_update(all_syms, notify_fn=_raw)
+                _raw("✅ DB init complete. Send /run to scan.")
             except Exception as e:
-                tg_send(f"Init error: {e}", chat_id=chat_id)
-        tg_answer(chat_id, "🔄 Force re-downloading all 200-day history...")
+                import traceback
+                _raw(f"INIT ERROR: {e}\n{traceback.format_exc()[-500:]}")
+        tg_answer(chat_id, "🔄 Starting DB init...")
         threading.Thread(target=_force_init, daemon=True).start()
+
     elif text.startswith('/status'):
         if _last_run_time:
             tg_answer(chat_id, f"🕒 *Last run:* {_last_run_time}\n\n{_last_run_summary}")
