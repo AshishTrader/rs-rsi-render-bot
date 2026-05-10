@@ -12,7 +12,7 @@ log = logging.getLogger('DB_MGR')
 _col = None  # MongoDB collection (lazy init)
 
 MONGO_URI = os.environ.get('MONGODB_URI', '')
-LOOKBACK  = 200  # days of history to keep
+LOOKBACK  = 100  # days of history to keep (RS_P=70 + 30 buffer is enough)
 
 
 def _get_col():
@@ -62,7 +62,7 @@ def _set_last_update(date_str: str):
     )
 
 
-def _fetch_and_merge(symbols, start, is_init=False):
+def _fetch_and_merge(symbols, start, is_init=False, notify_fn=None):
     """Download close prices in batches of 20 and merge into MongoDB."""
     BATCH = 20
     batches = [symbols[i:i+BATCH] for i in range(0, len(symbols), BATCH)]
@@ -96,6 +96,9 @@ def _fetch_and_merge(symbols, start, is_init=False):
         except Exception as e:
             log.error(f"Batch {b_idx+1} error: {e}")
         log.info(f"  Batch {b_idx+1}/{len(batches)} — {ok} symbols stored")
+        # Notify every 5 batches so user sees progress
+        if notify_fn and (b_idx + 1) % 5 == 0:
+            notify_fn(f"⏳ DB init: {b_idx+1}/{len(batches)} batches done ({ok} stocks saved)...")
     return ok
 
 
@@ -136,7 +139,7 @@ def init_or_update(all_symbols, notify_fn=None):
     except Exception as e:
         log.error(f"Nifty DB error: {e}")
 
-    ok = _fetch_and_merge(all_symbols, start, is_init=is_init)
+    ok = _fetch_and_merge(all_symbols, start, is_init=is_init, notify_fn=notify_fn)
     _set_last_update(today)
 
     if notify_fn:
