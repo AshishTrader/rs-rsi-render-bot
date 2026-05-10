@@ -1,19 +1,22 @@
 """
-MongoDB manager — stores Close prices for all stocks.
-First run: downloads 200 days in batches of 20 (low memory).
-Daily: fetches only last 7 days and merges.
+MongoDB manager — persistent Close price storage.
+Uses individual yf.Ticker downloads (constant memory, no OOM).
+4 threads for speed: ~2-3 min for 550 stocks.
 """
 import os, gc, logging
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import yfinance as yf
 
-log = logging.getLogger('DB_MGR')
-_col = None  # MongoDB collection (lazy init)
-
+log      = logging.getLogger('DB_MGR')
+_col     = None
 MONGO_URI = os.environ.get('MONGODB_URI', '')
-LOOKBACK  = 100  # days of history to keep (RS_P=70 + 30 buffer is enough)
+LOOKBACK  = 100   # trading-day history to keep (RS=70 + 30 buffer)
+THREADS   = 5     # parallel downloads
 
+
+# ── MongoDB helpers ──────────────────────────────────────────────────────────
 
 def _get_col():
     global _col
@@ -25,28 +28,25 @@ def _get_col():
     return _col
 
 
-def _save(sym, series: pd.Series):
-    """Store a Close Series for one symbol."""
-    series = series.sort_index().tail(LOOKBACK)
+def _save(sym: str, s: pd.Series):
+    s = s.dropna().sort_index().tail(LOOKBACK)
+    if s.empty:
+        return
     _get_col().update_one(
         {'_id': sym},
-        {'$set': {
-            'dates':  [str(d.date()) for d in series.index],
-            'closes': [round(float(v), 4) for v in series.values]
-        }},
+        {'$set': {'dates':  [str(d.date()) for d in s.index],
+                  'closes': [round(float(v), 4) for v in s.values]}},
         upsert=True
     )
 
 
-def _load(sym) -> pd.Series:
+def _load(sym: str) -> pd.Series:
     doc = _get_col().find_one({'_id': sym}, {'dates': 1, 'closes': 1})
     if not doc:
         return pd.Series(dtype=float)
-    return pd.Series(
-        doc['closes'],
-        index=pd.to_datetime(doc['dates']),
-        dtype=float
-    )
+    return pd.Series(doc['closes'],
+                     index=pd.to_datetime(doc['dates']),
+                     dtype=float)
 
 
 def get_last_update() -> str:
@@ -54,107 +54,113 @@ def get_last_update() -> str:
     return doc['last_update'] if doc else ''
 
 
-def _set_last_update(date_str: str):
-    _get_col().update_one(
-        {'_id': '__meta__'},
-        {'$set': {'last_update': date_str}},
-        upsert=True
-    )
+def _set_last_update(d: str):
+    _get_col().update_one({'_id': '__meta__'},
+                          {'$set': {'last_update': d}}, upsert=True)
 
 
-def _fetch_and_merge(symbols, start, is_init=False, notify_fn=None):
-    """Download close prices in batches of 20 and merge into MongoDB."""
-    BATCH = 20
-    batches = [symbols[i:i+BATCH] for i in range(0, len(symbols), BATCH)]
-    ok = 0
-    for b_idx, batch in enumerate(batches):
-        tickers = [s + '.NS' for s in batch]
-        try:
-            raw = yf.download(
-                tickers, start=start,
-                auto_adjust=True, progress=False, group_by='ticker'
-            )
-            for sym in batch:
-                try:
-                    if isinstance(raw.columns, pd.MultiIndex):
-                        new_s = raw[sym + '.NS']['Close'].dropna()
-                    else:
-                        new_s = raw['Close'].dropna()
-                    if len(new_s) < 3:
-                        continue
-                    if not is_init:
-                        existing = _load(sym)
-                        if not existing.empty:
-                            new_s = pd.concat([existing, new_s])
-                            new_s = new_s[~new_s.index.duplicated(keep='last')]
-                    _save(sym, new_s)
-                    ok += 1
-                except Exception:
-                    pass
-            del raw
-            gc.collect()
-        except Exception as e:
-            log.error(f"Batch {b_idx+1} error: {e}")
-        log.info(f"  Batch {b_idx+1}/{len(batches)} — {ok} symbols stored")
-        # Notify every 5 batches so user sees progress
-        if notify_fn and (b_idx + 1) % 5 == 0:
-            notify_fn(f"⏳ DB init: {b_idx+1}/{len(batches)} batches done ({ok} stocks saved)...")
-    return ok
+# ── Download one stock (called in thread) ───────────────────────────────────
+
+def _dl_one(sym: str, start: str, existing: pd.Series) -> tuple:
+    """Download a single ticker; returns (sym, close_series)."""
+    try:
+        t = yf.Ticker(sym + '.NS')
+        hist = t.history(start=start, auto_adjust=True)
+        if hist.empty or 'Close' not in hist.columns:
+            return sym, pd.Series(dtype=float)
+        new_s = hist['Close'].dropna()
+        new_s.index = new_s.index.tz_localize(None)
+        if not existing.empty:
+            new_s = pd.concat([existing, new_s])
+            new_s = new_s[~new_s.index.duplicated(keep='last')]
+        return sym, new_s
+    except Exception as e:
+        log.debug(f"{sym} download error: {e}")
+        return sym, pd.Series(dtype=float)
 
 
-def init_or_update(all_symbols, notify_fn=None):
+# ── Main public function ─────────────────────────────────────────────────────
+
+def init_or_update(all_symbols: list, notify_fn=None):
     """
-    Call this before every scan.
-    First time: downloads LOOKBACK days for all symbols (slow, ~5 min).
-    After that:  fetches only last 10 calendar days and merges (fast, ~1 min).
+    First run  → downloads LOOKBACK+10 calendar days for every symbol.
+    Later runs → downloads last 12 days and merges.
     """
     today = datetime.utcnow().strftime('%Y-%m-%d')
     last  = get_last_update()
 
     if last == today:
         if notify_fn:
-            notify_fn("✅ DB already up to date for today.")
+            notify_fn("✅ DB already up to date.")
         return
 
-    is_init  = (last == '')
-    days     = LOOKBACK + 10 if is_init else 12
-    start    = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d')
-    label    = f"{'INIT (200 days)' if is_init else 'daily update'}"
+    is_init = (last == '')
+    days    = LOOKBACK * 2 if is_init else 14   # 200 cal-days covers ~100 trading-days
+    start   = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d')
+    mode    = "INIT (first run)" if is_init else "daily update"
+    total   = len(all_symbols)
 
-    log.info(f"DB {label}: {len(all_symbols)} symbols from {start}")
+    log.info(f"DB {mode}: {total} symbols from {start}")
     if notify_fn:
-        notify_fn(f"📦 DB {label} — fetching {len(all_symbols)} stocks in batches of 20...")
+        notify_fn(f"📦 DB {mode} — {total} stocks, {THREADS} threads. "
+                  f"{'~3 min' if is_init else '~1 min'}...")
 
-    # Nifty index
+    # Nifty index (sequential, fast)
     try:
-        ni = yf.download('^NSEI', start=start, auto_adjust=True, progress=False)
+        ni = yf.Ticker('^NSEI').history(start=start, auto_adjust=True)
         if not ni.empty:
             s = ni['Close'].dropna()
+            s.index = s.index.tz_localize(None)
             if not is_init:
-                existing = _load('__NSEI__')
-                if not existing.empty:
-                    s = pd.concat([existing, s])
+                ex = _load('__NSEI__')
+                if not ex.empty:
+                    s = pd.concat([ex, s])
                     s = s[~s.index.duplicated(keep='last')]
             _save('__NSEI__', s)
     except Exception as e:
-        log.error(f"Nifty DB error: {e}")
+        log.error(f"Nifty error: {e}")
 
-    ok = _fetch_and_merge(all_symbols, start, is_init=is_init, notify_fn=notify_fn)
+    # Load existing data for incremental merge
+    existing = {} if is_init else {sym: _load(sym) for sym in all_symbols}
+
+    # Download stocks in parallel
+    ok = 0
+    done = 0
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        futs = {ex.submit(_dl_one, sym, start, existing.get(sym, pd.Series(dtype=float))): sym
+                for sym in all_symbols}
+        for fut in as_completed(futs):
+            sym, s = fut.result()
+            if len(s) >= 10:
+                _save(sym, s)
+                ok += 1
+            done += 1
+            if done % 50 == 0:
+                log.info(f"  {done}/{total} done ({ok} saved)")
+                if notify_fn:
+                    notify_fn(f"⏳ DB {mode}: {done}/{total} stocks done ({ok} saved)...")
+
     _set_last_update(today)
-
+    log.info(f"DB {mode} complete: {ok}/{total} saved.")
     if notify_fn:
-        notify_fn(f"✅ DB updated — {ok}/{len(all_symbols)} stocks stored.")
+        notify_fn(f"✅ DB {mode} complete — {ok}/{total} stocks stored.")
 
 
-def load_universe(symbols, rs_period=70):
-    """Load nifty + stock Close data from MongoDB for signal computation."""
+# ── Load universe for signal computation ────────────────────────────────────
+
+def load_universe(symbols: list, rs_period: int = 70):
+    """Load Close data from MongoDB — fast, low memory."""
     nifty = _load('__NSEI__')
-
-    data = {}
-    for sym in symbols:
-        s = _load(sym)
+    data  = {}
+    syms  = [s['_id'] for s in _get_col().find(
+        {'_id': {'$in': symbols}}, {'dates': 1, 'closes': 1})]
+    # Actually load full docs
+    for doc in _get_col().find({'_id': {'$in': symbols}}, {'dates': 1, 'closes': 1}):
+        sym = doc['_id']
+        s   = pd.Series(doc['closes'],
+                        index=pd.to_datetime(doc['dates']),
+                        dtype=float)
         if len(s) >= rs_period + 5:
             data[sym] = pd.DataFrame({'Close': s})
-
     log.info(f"Loaded from DB: {len(data)}/{len(symbols)} stocks")
     return nifty, data
