@@ -113,7 +113,7 @@ if UNIVERSE in ('BOTH', 'N200'):
 if UNIVERSE in ('BOTH', 'N500'):
     UNIVERSES['Nifty500'] = {'stocks': NIFTY500, 'capital': CAP_N500}
 
-# ── IN-MEMORY STATE (resets on restart, that's OK) ───────────
+# ── STATE (persisted to MongoDB so holdings survive Render restarts) ───
 _state = {}
 _last_run_time = None
 _last_run_summary = "No scan run yet."
@@ -284,7 +284,16 @@ def run_scan(triggered_by="scheduler", reply_chat_id=None):
 
         all_msgs = []
 
-        # ── UPDATE MONGODB (first run: 200 days; after: 7 days) ──
+        # ── LOAD PERSISTENT STATE FROM MONGODB ───────────────────────
+        try:
+            saved = db_manager._get_col().find_one({'_id': '__bot_state__'})
+            if saved and 'state' in saved:
+                _state.update(saved['state'])
+                log.info(f"State loaded from MongoDB: {list(_state.keys())}")
+        except Exception as e:
+            log.warning(f"Could not load state: {e}")
+
+        # ── UPDATE MONGODB PRICE DATA ──────────────────────────────
         all_syms = list(set(sum([v['stocks'] for v in UNIVERSES.values()], [])))
         db_manager.init_or_update(all_syms, notify_fn=notify)
 
@@ -377,6 +386,17 @@ def run_scan(triggered_by="scheduler", reply_chat_id=None):
 
         _last_run_time    = now_ist.strftime('%d %b %Y, %I:%M %p IST')
         _last_run_summary = '\n'.join(all_msgs)
+
+        # ── SAVE STATE TO MONGODB (survives Render restarts) ─────────
+        try:
+            db_manager._get_col().update_one(
+                {'_id': '__bot_state__'},
+                {'$set': {'state': _state, 'last_run': _last_run_time}},
+                upsert=True
+            )
+            log.info("State saved to MongoDB.")
+        except Exception as e:
+            log.warning(f"Could not save state: {e}")
 
         notify(_last_run_summary)
         notify(f"✅ *Scan Complete* | {_last_run_time}")
