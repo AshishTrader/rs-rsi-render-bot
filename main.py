@@ -6,6 +6,7 @@ RS + RSI Telegram Bot — Render Cloud Edition
 - No state persistence, no Angel One, no Excel
 """
 import os, gc, logging, threading, time, requests
+import db_manager
 from datetime import datetime, timedelta, date
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -283,6 +284,10 @@ def run_scan(triggered_by="scheduler", reply_chat_id=None):
 
         all_msgs = []
 
+        # ── UPDATE MONGODB (first run: 200 days; after: 7 days) ──
+        all_syms = list(set(sum([v['stocks'] for v in UNIVERSES.values()], [])))
+        db_manager.init_or_update(all_syms, notify_fn=notify)
+
         for uname, ucfg in UNIVERSES.items():
             u_state = _state.setdefault(uname, {
                 'holdings': {},
@@ -290,8 +295,8 @@ def run_scan(triggered_by="scheduler", reply_chat_id=None):
                 'capital': ucfg['capital']
             })
 
-            notify(f"⏳ Fetching data for *{uname}* ({len(ucfg['stocks'])} stocks)...")
-            nifty, data = fetch_data(ucfg['stocks'])
+            notify(f"⏳ Loading *{uname}* ({len(ucfg['stocks'])} stocks) from DB...")
+            nifty, data = db_manager.load_universe(ucfg['stocks'], RS_P)
             notify(f"✅ Loaded {len(data)} stocks for *{uname}*. Running signals...")
 
             msgs = [f"\n📁 *{uname}*\n{'─'*20}"]
@@ -425,8 +430,19 @@ def webhook():
             f"📊 Universe: *{UNIVERSE}* | Top {TOP_N} stocks"
         )
     elif text.startswith('/run'):
-        tg_answer(chat_id, "🔄 Starting RS+RSI scan now... Please wait ~5-8 minutes (batched download).")
+        tg_answer(chat_id, "🔄 Starting scan... First run takes ~5 min (DB init). Later runs ~1 min.")
         threading.Thread(target=run_scan, args=("manual /run", chat_id), daemon=True).start()
+    elif text.startswith('/init'):
+        def _force_init():
+            try:
+                all_syms = list(set(sum([v['stocks'] for v in UNIVERSES.values()], [])))
+                db_manager._get_col().delete_many({})
+                db_manager.init_or_update(all_syms, notify_fn=lambda t: tg_send(t, chat_id=chat_id))
+                tg_send("✅ DB re-initialized. Send /run to scan.", chat_id=chat_id)
+            except Exception as e:
+                tg_send(f"Init error: {e}", chat_id=chat_id)
+        tg_answer(chat_id, "🔄 Force re-downloading all 200-day history...")
+        threading.Thread(target=_force_init, daemon=True).start()
     elif text.startswith('/status'):
         if _last_run_time:
             tg_answer(chat_id, f"🕒 *Last run:* {_last_run_time}\n\n{_last_run_summary}")
